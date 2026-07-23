@@ -88,6 +88,42 @@ def _frozen_parquet_path(gres: str, taxid: Optional[int], tag: str) -> str:
     return _lookup_frozen_path(gres, taxid, tag)
 
 
+def _resolve_source(
+    gres: str,
+    taxid: Optional[int],
+    freeze_tag: Optional[str],
+) -> tuple[str, bool]:
+    """Return (view_name, taxid_already_applied) for a resource request.
+
+    Creates the appropriate duckdb VIEW if it does not yet exist.
+
+    * frozen snapshot  -> VIEW over local parquet, taxid pre-filtered
+    * live local cache -> VIEW over local parquet, taxid pre-filtered
+    * remote OSN       -> VIEW over remote parquet, taxid NOT applied
+    """
+    con = get_connection()
+
+    if freeze_tag is not None:
+        local = _frozen_parquet_path(gres, taxid, freeze_tag)
+        vname = "v_frozen_" + re.sub(r"[^A-Za-z0-9]", "_", gres) + f"_{taxid}_{freeze_tag}"
+        con.execute(
+            f"CREATE OR REPLACE VIEW {vname} AS "
+            f"SELECT * FROM read_parquet('{local}')"
+        )
+        return vname, True
+
+    local = _cached_parquet_path(gres, taxid)
+    if local is not None:
+        vname = "v_local_" + re.sub(r"[^A-Za-z0-9]", "_", gres) + f"_{taxid}"
+        con.execute(
+            f"CREATE OR REPLACE VIEW {vname} AS "
+            f"SELECT * FROM read_parquet('{local}')"
+        )
+        return vname, True
+
+    return _ensure_view(gres), False
+
+
 def open_ncbi_gene(
     resource: str = "gene_info",
     taxid: Optional[int] = None,
@@ -115,39 +151,18 @@ def open_ncbi_gene(
     con = get_connection()
     tcol = taxid_column(gres)
 
-    if freeze_tag is not None:
-        local = _frozen_parquet_path(gres, taxid, freeze_tag)
-        vname = "v_frozen_" + re.sub(r"[^A-Za-z0-9]", "_", gres) + f"_{taxid}_{freeze_tag}"
-        con.execute(
-            f"CREATE OR REPLACE VIEW {vname} AS "
-            f"SELECT * FROM read_parquet('{local}')"
-        )
-        cols = [c for c in con.table(vname).columns if c != tcol]
-        quoted = ", ".join(f'"{c}"' for c in cols)
-        return con.sql(f"SELECT {quoted} FROM {vname}")
+    vname, taxid_applied = _resolve_source(gres, taxid, freeze_tag)
+    all_cols = con.table(vname).columns
+    cols = [c for c in all_cols if c != tcol]
+    quoted = ", ".join(f'"{c}"' for c in cols)
 
-    local = _cached_parquet_path(gres, taxid)
-    if local is not None:
-        vname = "v_local_" + re.sub(r"[^A-Za-z0-9]", "_", gres) + f"_{taxid}"
-        con.execute(
-            f"CREATE OR REPLACE VIEW {vname} AS "
-            f"SELECT * FROM read_parquet('{local}')"
-        )
-        cols = [c for c in con.table(vname).columns if c != tcol]
-        quoted = ", ".join(f'"{c}"' for c in cols)
-        return con.sql(f"SELECT {quoted} FROM {vname}")
-
-    # remote OSN -- _ensure_view validates the resource name
-    vname = _ensure_view(gres)
-    rel = con.table(vname)
-    if taxid is not None:
-        cols = [c for c in rel.columns if c != tcol]
-        quoted = ", ".join(f'"{c}"' for c in cols)
-        # taxid is an int -- safe to interpolate
+    if taxid is not None and not taxid_applied:
         return con.sql(
             f'SELECT {quoted} FROM {vname} WHERE "{tcol}" = {int(taxid)}'
         )
-    return rel
+    if taxid is not None:
+        return con.sql(f"SELECT {quoted} FROM {vname}")
+    return con.table(vname)
 
 
 def ncbi_gene_fields(resource: str = "gene_info") -> pd.DataFrame:

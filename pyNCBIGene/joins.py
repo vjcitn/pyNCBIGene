@@ -4,7 +4,7 @@ from typing import Optional, Union
 
 import pandas as pd
 
-from .remote import _ensure_view, _validate_column, ncbi_gene_fields
+from .remote import _resolve_source, _validate_column, ncbi_gene_fields
 from ._state import get_connection, taxid_column
 
 
@@ -66,40 +66,19 @@ def join_ncbi_gene(
 
     con = get_connection()
 
-    # use frozen or live local parquet if available, else the remote VIEW
-    if freeze_tag is not None:
-        from .remote import _frozen_parquet_path
-        local_path = _frozen_parquet_path(gres, taxid, freeze_tag)
-        vname = "v_frozen_" + gres.replace("-", "_") + f"_{taxid}_{freeze_tag}"
-        con.execute(
-            f"CREATE OR REPLACE VIEW {vname} AS "
-            f"SELECT * FROM read_parquet('{local_path}')"
-        )
-    else:
-        from .remote import _cached_parquet_path
-        local_path = _cached_parquet_path(gres, taxid)
-        if local_path is not None:
-            vname = "v_local_" + gres.replace("-", "_") + f"_{taxid}"
-            con.execute(
-                f"CREATE OR REPLACE VIEW {vname} AS "
-                f"SELECT * FROM read_parquet('{local_path}')"
-            )
-        else:
-            vname = _ensure_view(gres)
+    vname, taxid_applied = _resolve_source(gres, taxid, freeze_tag)
 
     # register the local DataFrame -- zero-copy, stays in-process
     tmp = f"_local_{abs(id(local_df))}"
     con.register(tmp, local_df)
 
-    # join column names are validated above; taxid is int (safe to format)
     on_clause = " AND ".join(f'lhs."{c}" = rhs."{c}"' for c in by_cols)
     tcol = taxid_column(gres)
 
-    if taxid is not None and local_path is None:
-        # remote VIEW: add taxid WHERE clause (int, not user string)
-        where = f'WHERE rhs."{tcol}" = {int(taxid)}'
-    else:
-        where = ""
+    where = (
+        "" if taxid is None or taxid_applied
+        else f'WHERE rhs."{tcol}" = {int(taxid)}'
+    )
 
     return con.sql(
         f"SELECT * FROM {tmp} lhs "

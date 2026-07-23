@@ -2,6 +2,7 @@
 
 import re
 import shutil
+import os
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -66,7 +67,8 @@ def cache_by_taxon(
         vname = f"v_{re.sub(r'[^A-Za-z0-9]', '_', gres)}"
         tcol = taxid_column(gres)
 
-        tmp = tempfile.mktemp(suffix=".parquet")
+        fd, tmp = tempfile.mkstemp(suffix=".parquet")
+        os.close(fd)
         con.execute(
             f"COPY (SELECT * FROM {vname} WHERE \"{tcol}\" = {taxid}) "
             f"TO '{tmp}' (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 15)"
@@ -218,7 +220,8 @@ def freeze_taxon_cache(
             _bfc_remove([h["rid"] for h in old])
 
         src = live[0].get("rpath") or live[0].get("fpath", "")
-        tmp = tempfile.mktemp(suffix=".parquet")
+        fd, tmp = tempfile.mkstemp(suffix=".parquet")
+        os.close(fd)
         shutil.copy2(src, tmp)
 
         try:
