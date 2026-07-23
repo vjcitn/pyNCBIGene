@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "pyNCBIGene"
+version = "0.1.0"
+description = "Access NCBI Gene parquet resources in an NSF OSN bucket via duckdb"
+authors = [
+    {name = "Vincent J. Carey", email = "stvjc@channing.harvard.edu"},
+]
+license = {text = "Artistic-2.0"}
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "duckdb>=1.0.0",
+    "pandas>=1.5.0",
+    "pybiocfilecache",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/vjcitn/RNCBIGene"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyNCBIGene*"]
