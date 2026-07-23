@@ -2,7 +2,8 @@
 
 from typing import Optional
 
-from .remote import open_ncbi_gene
+from ._state import get_connection, taxid_column
+from .remote import _ensure_view, _validate_column, ncbi_gene_fields
 
 
 def map_ids_ng(
@@ -14,9 +15,9 @@ def map_ids_ng(
 ) -> dict:
     """Map identifiers using NCBI Gene parquet resources.
 
-    All filtering is pushed to duckdb before a single ``.df()`` retrieves only
-    the matched rows.  For Ensembl keytype or column, a JOIN between
-    ``gene2ensembl`` and ``gene_info`` runs entirely in duckdb.
+    All filtering uses parameterized duckdb queries -- user-supplied key values
+    are never interpolated into SQL strings.  Column names (keytype, column) are
+    validated against the resource schema before use.
 
     Parameters
     ----------
@@ -25,12 +26,11 @@ def map_ids_ng(
     keytype : str
         One of ``"Symbol"``, ``"GeneID"``, or ``"Ensembl"``.
     column : str
-        Output annotation column (e.g. ``"GeneID"``, ``"map_location"``,
-        ``"Ensembl"``).
+        Output annotation column.
     taxid : int
         NCBI taxonomy ID.
     freeze_tag : str or None
-        When set, uses a frozen snapshot (see :func:`freeze_taxon_cache`).
+        When set, uses a frozen snapshot.
 
     Returns
     -------
@@ -41,62 +41,73 @@ def map_ids_ng(
     if keytype not in supported:
         raise ValueError(f"{keytype} keytype not supported. Use one of {supported}.")
 
-    keys_sql = ", ".join(f"'{k}'" for k in keys)
+    con = get_connection()
+    keys = list(keys)
+    placeholders = ", ".join(["?"] * len(keys))
+    # taxid is always an int -- safe to format directly
+    taxid = int(taxid)
 
-    def _info(cols):
-        return (
-            open_ncbi_gene("gene_info", taxid, freeze_tag=freeze_tag)
-            .select(cols)
-        )
+    # validate column names against known schema (not user data, but still checked)
+    if keytype != "Ensembl":
+        _validate_column(keytype, "gene_info")
+    if column not in ("Ensembl",):
+        _validate_column(column, "gene_info")
 
-    def _g2e():
-        return open_ncbi_gene("gene2ensembl", taxid, freeze_tag=freeze_tag)
+    # ensure required VIEWs exist
+    gi_vname  = _ensure_view("gene_info")
+    g2e_vname = _ensure_view("gene2ensembl") if (keytype == "Ensembl" or column == "Ensembl") else None
+    gi_tcol   = taxid_column("gene_info")
+    g2e_tcol  = taxid_column("gene2ensembl")
 
     if keytype == "Ensembl":
-        g2e = _g2e()
-        g2e_f = g2e.filter(
-            f'"Ensembl_gene_identifier" IN ({keys_sql})'
-        ).select('"GeneID", "Ensembl_gene_identifier"')
-
         if column == "GeneID":
-            df = g2e_f.df().rename(columns={"Ensembl_gene_identifier": "Ensembl"})
-        else:
-            info = _info(f'"GeneID", "{column}"')
-            from ._state import get_connection
-            con = get_connection()
-            con.register("_g2e_tmp", g2e_f.df())
-            con.register("_info_tmp", info.df())
-            df = con.sql(
-                f'SELECT g."Ensembl_gene_identifier" AS "Ensembl", i."{column}" '
-                'FROM _g2e_tmp g LEFT JOIN _info_tmp i USING ("GeneID")'
+            # gene2ensembl only -- single parameterized query
+            rows = con.execute(
+                f'SELECT "Ensembl_gene_identifier", "GeneID" '
+                f'FROM {g2e_vname} '
+                f'WHERE "{g2e_tcol}" = {taxid} '
+                f'AND "Ensembl_gene_identifier" IN ({placeholders})',
+                keys,
             ).df()
-        result = dict(zip(df["Ensembl"], df[column if column != "Ensembl" else "Ensembl"]))
+            result = dict(zip(rows["Ensembl_gene_identifier"], rows["GeneID"]))
+        else:
+            # JOIN gene2ensembl x gene_info entirely in duckdb, parameterized
+            rows = con.execute(
+                f'SELECT g."Ensembl_gene_identifier", i."{column}" '
+                f'FROM {g2e_vname} g '
+                f'JOIN {gi_vname} i ON g."GeneID" = i."GeneID" '
+                f'WHERE g."{g2e_tcol}" = {taxid} '
+                f'AND i."{gi_tcol}" = {taxid} '
+                f'AND g."Ensembl_gene_identifier" IN ({placeholders})',
+                keys,
+            ).df()
+            result = dict(zip(rows["Ensembl_gene_identifier"], rows[column]))
 
     elif column == "Ensembl":
-        info = _info(f'"GeneID", "{keytype}"').filter(
-            f'"{keytype}" IN ({keys_sql})'
-        )
-        g2e = _g2e().select('"GeneID", "Ensembl_gene_identifier"')
-        from ._state import get_connection
-        con = get_connection()
-        con.register("_info_tmp", info.df())
-        con.register("_g2e_tmp", g2e.df())
-        df = con.sql(
-            f'SELECT i."{keytype}", g."Ensembl_gene_identifier" AS "Ensembl" '
-            'FROM _info_tmp i LEFT JOIN _g2e_tmp g USING ("GeneID")'
+        # gene_info filter then join gene2ensembl -- parameterized
+        rows = con.execute(
+            f'SELECT i."{keytype}", g."Ensembl_gene_identifier" '
+            f'FROM {gi_vname} i '
+            f'LEFT JOIN {g2e_vname} g ON i."GeneID" = g."GeneID" '
+            f'  AND g."{g2e_tcol}" = {taxid} '
+            f'WHERE i."{gi_tcol}" = {taxid} '
+            f'AND i."{keytype}" IN ({placeholders})',
+            keys,
         ).df()
-        result = dict(zip(df[keytype], df["Ensembl"]))
+        result = dict(zip(rows[keytype], rows["Ensembl_gene_identifier"]))
 
     else:
-        df = (
-            open_ncbi_gene("gene_info", taxid, freeze_tag=freeze_tag)
-            .filter(f'"{keytype}" IN ({keys_sql})')
-            .select(f'"{keytype}", "{column}"')
-            .df()
-        )
+        # pure gene_info query -- parameterized
+        rows = con.execute(
+            f'SELECT "{keytype}", "{column}" '
+            f'FROM {gi_vname} '
+            f'WHERE "{gi_tcol}" = {taxid} '
+            f'AND "{keytype}" IN ({placeholders})',
+            keys,
+        ).df()
         # keep first match per key
         result = {}
-        for _, row in df.iterrows():
+        for _, row in rows.iterrows():
             k = row[keytype]
             if k not in result:
                 result[k] = row[column]

@@ -14,23 +14,12 @@ from ._state import (
     taxid_column,
 )
 
-# session-level cache of available resource names
+# session-level cache of available resource names (strings, not user input)
 _resource_names: list[str] | None = None
 
 
 def available_ncbi_parquet() -> list[str]:
-    """List parquet resources currently in the OSN bucket.
-
-    Returns
-    -------
-    list[str]
-        Sorted list of parquet file names, e.g. ``["gene_info.parquet", ...]``.
-
-    Raises
-    ------
-    RuntimeError
-        If the bucket listing cannot be fetched.
-    """
+    """List parquet resources currently in the OSN bucket."""
     with urllib.request.urlopen(OSN_LISTING_URL) as resp:
         xml = resp.read().decode()
     keys = re.findall(r"<Key>([^<]+\.parquet)</Key>", xml)
@@ -46,6 +35,42 @@ def _resource_name_list() -> list[str]:
     if _resource_names is None:
         _resource_names = [r.replace(".parquet", "") for r in available_ncbi_parquet()]
     return _resource_names
+
+
+def _validate_resource(gres: str) -> None:
+    if gres not in _resource_name_list():
+        raise ValueError(
+            f"'{gres}' is not an available resource. "
+            "Call available_ncbi_parquet() to see options."
+        )
+
+
+def _validate_column(col: str, gres: str) -> None:
+    """Raise ValueError if col is not a valid column name for gres."""
+    valid = ncbi_gene_fields(gres)["column_name"].tolist()
+    if col not in valid:
+        raise ValueError(
+            f"Column '{col}' not found in '{gres}'. "
+            f"Available: {valid}"
+        )
+
+
+def _safe_vname(gres: str) -> str:
+    """Return the duckdb VIEW name for a resource (always derived, never user-supplied)."""
+    return "v_" + re.sub(r"[^A-Za-z0-9]", "_", gres)
+
+
+def _ensure_view(gres: str) -> str:
+    """Ensure the remote VIEW for gres exists; return its name."""
+    _validate_resource(gres)
+    con = get_connection()
+    url = OSN_BASE.format(gres)
+    vname = _safe_vname(gres)
+    con.execute(
+        f"CREATE OR REPLACE VIEW {vname} AS "
+        f"SELECT * FROM read_parquet('{url}')"
+    )
+    return vname
 
 
 def _cached_parquet_path(gres: str, taxid: Optional[int]) -> Optional[str]:
@@ -75,11 +100,11 @@ def open_ncbi_gene(
     resource : str
         Resource name with or without ``.parquet`` suffix.
     taxid : int or None
-        When provided, filters to this NCBI taxonomy ID and drops the
-        ``#tax_id`` column from the result.
+        When provided, filters to this NCBI taxonomy ID and drops the taxid
+        column from the result.
     freeze_tag : str or None
-        When provided, opens a frozen snapshot created by
-        :func:`freeze_taxon_cache`. Raises ``KeyError`` if not found.
+        When provided, opens a frozen snapshot.  Raises ``KeyError`` if not
+        found.
 
     Returns
     -------
@@ -87,57 +112,40 @@ def open_ncbi_gene(
         Lazy relation -- chain ``.filter()``, ``.select()``, ``.df()`` etc.
     """
     gres = resource.replace(".parquet", "")
-    avail = _resource_name_list()
-    if gres not in avail:
-        raise ValueError(
-            f"'{gres}' is not an available resource. "
-            "Call available_ncbi_parquet() to see options."
-        )
-
     con = get_connection()
     tcol = taxid_column(gres)
 
-    # frozen snapshot takes precedence
     if freeze_tag is not None:
         local = _frozen_parquet_path(gres, taxid, freeze_tag)
-        vname = f"v_frozen_{re.sub(r'[^A-Za-z0-9]', '_', gres)}_{taxid}_{freeze_tag}"
+        vname = "v_frozen_" + re.sub(r"[^A-Za-z0-9]", "_", gres) + f"_{taxid}_{freeze_tag}"
         con.execute(
             f"CREATE OR REPLACE VIEW {vname} AS "
             f"SELECT * FROM read_parquet('{local}')"
         )
-        rel = con.table(vname)
-        cols = [c for c in rel.columns if c != tcol]
-        return con.sql(
-            f"SELECT {', '.join(f'\"' + c + '\"' for c in cols)} FROM {vname}"
-        )
+        cols = [c for c in con.table(vname).columns if c != tcol]
+        quoted = ", ".join(f'"{c}"' for c in cols)
+        return con.sql(f"SELECT {quoted} FROM {vname}")
 
-    # live local cache
     local = _cached_parquet_path(gres, taxid)
     if local is not None:
-        vname = f"v_local_{re.sub(r'[^A-Za-z0-9]', '_', gres)}_{taxid}"
+        vname = "v_local_" + re.sub(r"[^A-Za-z0-9]", "_", gres) + f"_{taxid}"
         con.execute(
             f"CREATE OR REPLACE VIEW {vname} AS "
             f"SELECT * FROM read_parquet('{local}')"
         )
-        rel = con.table(vname)
-        cols = [c for c in rel.columns if c != tcol]
-        return con.sql(
-            f"SELECT {', '.join(f'\"' + c + '\"' for c in cols)} FROM {vname}"
-        )
+        cols = [c for c in con.table(vname).columns if c != tcol]
+        quoted = ", ".join(f'"{c}"' for c in cols)
+        return con.sql(f"SELECT {quoted} FROM {vname}")
 
-    # remote OSN
-    url = OSN_BASE.format(gres)
-    vname = f"v_{re.sub(r'[^A-Za-z0-9]', '_', gres)}"
-    con.execute(
-        f"CREATE OR REPLACE VIEW {vname} AS "
-        f"SELECT * FROM read_parquet('{url}')"
-    )
+    # remote OSN -- _ensure_view validates the resource name
+    vname = _ensure_view(gres)
     rel = con.table(vname)
     if taxid is not None:
         cols = [c for c in rel.columns if c != tcol]
+        quoted = ", ".join(f'"{c}"' for c in cols)
+        # taxid is an int -- safe to interpolate
         return con.sql(
-            f"SELECT {', '.join(f'\"' + c + '\"' for c in cols)} "
-            f"FROM {vname} WHERE \"{tcol}\" = {taxid}"
+            f'SELECT {quoted} FROM {vname} WHERE "{tcol}" = {int(taxid)}'
         )
     return rel
 
@@ -156,21 +164,13 @@ def ncbi_gene_fields(resource: str = "gene_info") -> pd.DataFrame:
         Data frame with columns ``column_name`` and ``column_type``.
     """
     gres = resource.replace(".parquet", "")
-    open_ncbi_gene(gres)  # validates and creates view
-    vname = f"v_{re.sub(r'[^A-Za-z0-9]', '_', gres)}"
+    vname = _ensure_view(gres)
     result = get_connection().execute(f"DESCRIBE {vname}").df()
     return result[["column_name", "column_type"]]
 
 
 def ncbi_parquet_info() -> pd.DataFrame:
-    """Retrieve size, upload date, and NCBI source date for each bucket resource.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: ``resource``, ``size_bytes``, ``bucket_modified``,
-        ``ncbi_last_modified`` (NaN if provenance.json not yet uploaded).
-    """
+    """Retrieve size, upload date, and NCBI source date for each bucket resource."""
     with urllib.request.urlopen(OSN_LISTING_URL) as resp:
         xml = resp.read().decode()
 
