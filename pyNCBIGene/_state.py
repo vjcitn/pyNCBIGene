@@ -35,9 +35,17 @@ def taxid_column(gres: str) -> str:
     return TAXID_COL.get(gres, "#tax_id")
 
 
+def _connection_alive() -> bool:
+    try:
+        _con.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
 def get_connection() -> duckdb.DuckDBPyConnection:
     global _con
-    if _con is None or _con.is_closed():
+    if _con is None or not _connection_alive():
         ext_dir = Path.home() / ".cache" / "pyNCBIGene" / "duckdb_extensions"
         ext_dir.mkdir(parents=True, exist_ok=True)
         _con = duckdb.connect(config={"extension_directory": str(ext_dir)})
