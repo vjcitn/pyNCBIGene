@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyNCBIGene"
-version = "0.1.0"
+version = "0.1.1"
 description = "Access NCBI Gene parquet resources in an NSF OSN bucket via duckdb"
 authors = [
     {name = "Vincent J. Carey", email = "stvjc@channing.harvard.edu"},
