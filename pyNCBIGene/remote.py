@@ -168,6 +168,9 @@ def open_ncbi_gene(
 def ncbi_gene_fields(resource: str = "gene_info") -> pd.DataFrame:
     """Return column names and types for a resource.
 
+    Works offline if any taxon of this resource has been cached locally
+    (schema is taxid-independent).
+
     Parameters
     ----------
     resource : str
@@ -179,8 +182,28 @@ def ncbi_gene_fields(resource: str = "gene_info") -> pd.DataFrame:
         Data frame with columns ``column_name`` and ``column_type``.
     """
     gres = resource.replace(".parquet", "")
+    con = get_connection()
+
+    # Try any local cached version first -- no network needed.
+    try:
+        from ._cache import _bfc_query
+        hits = [h for h in (_bfc_query(f"{gres}_taxid") or [])
+                if "_frozen_" not in h.get("rname", "")]
+        if hits:
+            local = hits[0].get("rpath") or hits[0].get("fpath", "")
+            vname = "v_fields_" + re.sub(r"[^A-Za-z0-9]", "_", gres)
+            con.execute(
+                f"CREATE OR REPLACE VIEW {vname} AS "
+                f"SELECT * FROM read_parquet('{local}')"
+            )
+            result = con.execute(f"DESCRIBE {vname}").df()
+            return result[["column_name", "column_type"]]
+    except Exception:
+        pass
+
+    # Fall back to remote (requires network).
     vname = _ensure_view(gres)
-    result = get_connection().execute(f"DESCRIBE {vname}").df()
+    result = con.execute(f"DESCRIBE {vname}").df()
     return result[["column_name", "column_type"]]
 
 

@@ -3,7 +3,7 @@
 from typing import Optional
 
 from ._state import get_connection, taxid_column
-from .remote import _ensure_view, _validate_column, ncbi_gene_fields
+from .remote import _resolve_source, _validate_column
 
 
 def map_ids_ng(
@@ -15,9 +15,9 @@ def map_ids_ng(
 ) -> dict:
     """Map identifiers using NCBI Gene parquet resources.
 
-    All filtering uses parameterized duckdb queries -- user-supplied key values
-    are never interpolated into SQL strings.  Column names (keytype, column) are
-    validated against the resource schema before use.
+    Uses the local BiocFileCache when available, falling back to the remote
+    OSN bucket.  Works offline for cached taxa.  All filtering uses
+    parameterized duckdb queries.
 
     Parameters
     ----------
@@ -44,68 +44,69 @@ def map_ids_ng(
     con = get_connection()
     keys = list(keys)
     placeholders = ", ".join(["?"] * len(keys))
-    # taxid is always an int -- safe to format directly
     taxid = int(taxid)
 
-    # validate column names against known schema (not user data, but still checked)
+    need_g2e = keytype == "Ensembl" or column == "Ensembl"
+
+    # Resolve views via cache-first logic (no network when data is local).
+    gi_vname,  gi_taxid_applied  = _resolve_source("gene_info",    taxid, freeze_tag)
+    g2e_vname, g2e_taxid_applied = _resolve_source("gene2ensembl", taxid, freeze_tag) if need_g2e else (None, False)
+
+    gi_tcol  = taxid_column("gene_info")
+    g2e_tcol = taxid_column("gene2ensembl")
+
+    # Build WHERE clauses for taxid -- omit if already applied by local view.
+    gi_where  = "" if gi_taxid_applied  else f'AND "{gi_tcol}" = {taxid}'
+    g2e_where = "" if g2e_taxid_applied else f'AND "{g2e_tcol}" = {taxid}'
+
+    # Validate identifier column names (offline-safe -- uses ncbi_gene_fields
+    # which also checks local cache first).
     if keytype != "Ensembl":
         _validate_column(keytype, "gene_info")
     if column not in ("Ensembl",):
         _validate_column(column, "gene_info")
 
-    # ensure required VIEWs exist
-    gi_vname  = _ensure_view("gene_info")
-    g2e_vname = _ensure_view("gene2ensembl") if (keytype == "Ensembl" or column == "Ensembl") else None
-    gi_tcol   = taxid_column("gene_info")
-    g2e_tcol  = taxid_column("gene2ensembl")
-
     if keytype == "Ensembl":
         if column == "GeneID":
-            # gene2ensembl only -- single parameterized query
             rows = con.execute(
                 f'SELECT "Ensembl_gene_identifier", "GeneID" '
                 f'FROM {g2e_vname} '
-                f'WHERE "{g2e_tcol}" = {taxid} '
-                f'AND "Ensembl_gene_identifier" IN ({placeholders})',
+                f'WHERE "Ensembl_gene_identifier" IN ({placeholders}) '
+                f'{g2e_where}',
                 keys,
             ).df()
             result = dict(zip(rows["Ensembl_gene_identifier"], rows["GeneID"]))
         else:
-            # JOIN gene2ensembl x gene_info entirely in duckdb, parameterized
             rows = con.execute(
                 f'SELECT g."Ensembl_gene_identifier", i."{column}" '
                 f'FROM {g2e_vname} g '
                 f'JOIN {gi_vname} i ON g."GeneID" = i."GeneID" '
-                f'WHERE g."{g2e_tcol}" = {taxid} '
-                f'AND i."{gi_tcol}" = {taxid} '
-                f'AND g."Ensembl_gene_identifier" IN ({placeholders})',
+                f'WHERE g."Ensembl_gene_identifier" IN ({placeholders}) '
+                f'{g2e_where} {gi_where}',
                 keys,
             ).df()
             result = dict(zip(rows["Ensembl_gene_identifier"], rows[column]))
 
     elif column == "Ensembl":
-        # gene_info filter then join gene2ensembl -- parameterized
         rows = con.execute(
             f'SELECT i."{keytype}", g."Ensembl_gene_identifier" '
             f'FROM {gi_vname} i '
             f'LEFT JOIN {g2e_vname} g ON i."GeneID" = g."GeneID" '
-            f'  AND g."{g2e_tcol}" = {taxid} '
-            f'WHERE i."{gi_tcol}" = {taxid} '
-            f'AND i."{keytype}" IN ({placeholders})',
+            f'{g2e_where.replace("AND", "AND g.", 1) if g2e_where else ""} '
+            f'WHERE i."{keytype}" IN ({placeholders}) '
+            f'{gi_where}',
             keys,
         ).df()
         result = dict(zip(rows[keytype], rows["Ensembl_gene_identifier"]))
 
     else:
-        # pure gene_info query -- parameterized
         rows = con.execute(
             f'SELECT "{keytype}", "{column}" '
             f'FROM {gi_vname} '
-            f'WHERE "{gi_tcol}" = {taxid} '
-            f'AND "{keytype}" IN ({placeholders})',
+            f'WHERE "{keytype}" IN ({placeholders}) '
+            f'{gi_where}',
             keys,
         ).df()
-        # keep first match per key
         result = {}
         for _, row in rows.iterrows():
             k = row[keytype]

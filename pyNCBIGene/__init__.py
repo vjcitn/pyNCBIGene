@@ -13,6 +13,7 @@ from .mapids import map_ids_ng
 from .joins import join_ncbi_gene
 from .taxon_cache import (
     cache_by_taxon,
+    cached_ncbi_resources,
     clear_taxon_cache,
     freeze_taxon_cache,
     taxon_cache_info,
@@ -27,6 +28,7 @@ __all__ = [
     "map_ids_ng",
     "join_ncbi_gene",
     "cache_by_taxon",
+    "cached_ncbi_resources",
     "clear_taxon_cache",
     "freeze_taxon_cache",
     "taxon_cache_info",

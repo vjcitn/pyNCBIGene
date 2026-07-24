@@ -14,6 +14,45 @@ from ._cache import _live_key, _frozen_key, _bfc_query, _bfc_remove
 from .remote import available_ncbi_parquet, open_ncbi_gene
 
 
+def cached_ncbi_resources() -> pd.DataFrame:
+    """List annotation resources available for offline use.
+
+    Reads the local BiocFileCache without any network access and returns a
+    tidy summary of every resource that :func:`open_ncbi_gene` can serve
+    from disk.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ``resource``, ``taxid``, ``frozen``, ``tag``, ``rpath``.
+        Empty DataFrame (with a message) if nothing is cached.
+    """
+    try:
+        hits = _bfc_query("_taxid") or []
+    except ImportError:
+        hits = []
+    if not hits:
+        print("No resources cached. Run cache_by_taxon() to cache resources locally.")
+        return pd.DataFrame(columns=["resource", "taxid", "frozen", "tag", "rpath"])
+    rows = []
+    for h in hits:
+        rname = h.get("rname", "")
+        frozen = "_frozen_" in rname
+        taxid_match = re.search(r"_taxid(\d+)", rname)
+        taxid = int(taxid_match.group(1)) if taxid_match else None
+        resource = re.sub(r"_taxid\d+.*\.parquet$", "", rname)
+        tag_match = re.search(r"_frozen_([^.]+)\.parquet$", rname)
+        tag = tag_match.group(1) if tag_match else None
+        rows.append({
+            "resource": resource,
+            "taxid": taxid,
+            "frozen": frozen,
+            "tag": tag,
+            "rpath": h.get("rpath") or h.get("fpath", ""),
+        })
+    return pd.DataFrame(rows)
+
+
 def cache_by_taxon(
     taxid: int,
     resources: Optional[list] = None,
