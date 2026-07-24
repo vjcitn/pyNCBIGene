@@ -19,7 +19,7 @@ from .taxon_cache import (
     taxon_cache_info,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = [
     "available_ncbi_parquet",
     "ncbi_gene_fields",
